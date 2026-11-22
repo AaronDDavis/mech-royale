@@ -186,9 +186,33 @@ class WorldMap:
                 return False
         return True
 
+    def inside_prism(self, p: Dict[str, Any], x: float, y: float) -> bool:
+        x0, y0, x1, y1 = p["bbox"]
+        if x < x0 or x > x1 or y < y0 or y > y1:
+            return False
+        return point_in_ring(x, y, p["ring"]) and not any(point_in_ring(x, y, h) for h in p["holes"])
+
+    def tall_buildings_near(self, x: float, y: float, reach: int = 1) -> List[Dict[str, Any]]:
+        gx, gy = int(x // self.cs), int(y // self.cs)
+        seen = set()
+        out: List[Dict[str, Any]] = []
+        for ax in range(gx - reach, gx + reach + 1):
+            for ay in range(gy - reach, gy + reach + 1):
+                for idx in self.grid.get((ax, ay), []):
+                    if idx in seen:
+                        continue
+                    seen.add(idx)
+                    p = self.prisms[idx]
+                    if p["kind"] == "bridge":
+                        continue
+                    if p["top"] - p["base"] < 9.0 or p["top"] - self.terrain_z(*((p["bbox"][0] + p["bbox"][2]) / 2, (p["bbox"][1] + p["bbox"][3]) / 2)) < 9.0:
+                        continue
+                    out.append(p)
+        return out
+
 
 class Bot:
-    name = "apex-lean"
+    name = "apex-hide"
 
     def __init__(self, hello: mf.Hello) -> None:
         self.slot = int(hello.get("slot", 0))
@@ -221,6 +245,14 @@ class Bot:
         self._muzzle = 7.0
         self._errors = 0
         self.mode = "init"
+        self.retreat = False
+        self.holding = False
+        self.cover: Optional[Tuple[float, float]] = None
+        self.cover_tick = -999
+        self._hide_key: Optional[Tuple[int, int, int]] = None
+        self._hide_pt: Optional[Tuple[float, float]] = None
+        self._dodge_boost = False
+        self.scan_base = 0.0
 
     # ------------------------------------------------------------ LOS with per-tick cache
     def _los(self, me_pos, m: Dict[str, Any], h: float = 4.5) -> bool:
@@ -336,7 +368,8 @@ class Bot:
                 if s < best_s:
                     best, best_s = m, s
             return best, "mech"
-        in_zone = me.get("in_zone", True)
+        # dealing damage resets the 5 s regen timer: no farming while recovering
+        in_zone = me.get("in_zone", True) and not self.retreat
         hp_ok = me["hp"] > me["max_hp"] * 0.35
         npcs = [m for m in mechs if m.get("kind") == "npc"]
         if npcs and in_zone and hp_ok:
@@ -377,6 +410,9 @@ class Bot:
                 yaw = self.last_attacker_bearing
             elif self.last_sound_bearing is not None and tick - self.last_sound_tick < 25:
                 yaw = self.last_sound_bearing
+            elif self.holding:
+                # standing still in cover: sweep the front so we spot (and face) whoever walks up
+                yaw = self.scan_base + 1.3 * math.sin(tick * 0.05)
             elif math.hypot(move_dir[0], move_dir[1]) > 0.1:
                 yaw = math.atan2(move_dir[1], move_dir[0])
             else:
@@ -491,6 +527,97 @@ class Bot:
             aim_yaw, aim_pitch = override
         return [aim_yaw, aim_pitch], fire, reload_cmd
 
+    # ------------------------------------------------------------ hiding & cover
+    def _hide_spot(self, obs) -> Tuple[float, float]:
+        """A spot on our own side of the next zone, tucked against the wall of a tall building on the side
+        facing away from the zone centre (where the crowd converges). Cached per zone phase."""
+        z = obs["zone"]
+        nx, ny, nr = float(z["next_center"][0]), float(z["next_center"][1]), float(z["next_radius"])
+        key = (int(nx), int(ny), int(nr))
+        if self._hide_key == key and self._hide_pt is not None:
+            return self._hide_pt
+        mx, my, mz = obs["self"]["pos"]
+        bx, by = mx - nx, my - ny
+        bl = math.hypot(bx, by)
+        if bl < 1.0:
+            bx, by, bl = 1.0, 0.0, 1.0
+        bx, by = bx / bl, by / bl
+        r = 0.0 if nr < 45.0 else clamp(nr * 0.6, 0.0, nr - 25.0)
+        px, py = nx + bx * r, ny + by * r
+        pt = (px, py)
+        if r > 0.0:
+            best, best_d = None, 1e9
+            for p in self.world.tall_buildings_near(px, py, 1):
+                x0, y0, x1, y1 = p["bbox"]
+                cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+                if not self.world.inside_prism(p, cx, cy):
+                    continue
+                d = math.hypot(cx - px, cy - py)
+                if d > 60.0 or d >= best_d:
+                    continue
+                ux, uy = cx - nx, cy - ny
+                ul = math.hypot(ux, uy)
+                if ul < 1.0:
+                    continue
+                ux, uy = ux / ul, uy / ul
+                exit_t = None
+                for i in range(0, 60):
+                    t = i * 2.0
+                    if not self.world.inside_prism(p, cx + ux * t, cy + uy * t):
+                        exit_t = t
+                        break
+                if exit_t is None:
+                    continue
+                hx, hy = cx + ux * (exit_t + 5.0), cy + uy * (exit_t + 5.0)
+                blk, _ = self.world.is_blocked_point(hx, hy, self.world.terrain_z(hx, hy), 3.0, 9.0)
+                if blk or math.hypot(hx - nx, hy - ny) > nr - 12.0:
+                    continue
+                best, best_d = (hx, hy), d
+            if best is not None:
+                pt = best
+        self._hide_key, self._hide_pt = key, pt
+        return pt
+
+    def _cover_point(self, obs, threats) -> Optional[Tuple[float, float]]:
+        """Nearest nearby spot where every threat's line to our body and head is blocked by a building."""
+        tick = int(obs["tick"])
+        me = obs["self"]
+        mx, my, mz = me["pos"]
+        if self.cover is not None and tick - self.cover_tick < 8:
+            return self.cover
+        if self.slow or not threats:
+            return self.cover
+        cx, cy, cr = self._zone_now(obs)
+        tcx = sum(t["pos"][0] for t in threats) / len(threats)
+        tcy = sum(t["pos"][1] for t in threats) / len(threats)
+        d_me_t = math.hypot(mx - tcx, my - tcy)
+        best, best_s = None, 1e9
+        for rad in (14.0, 28.0):
+            for k in range(12):
+                a = k * math.pi / 6.0
+                px, py = mx + math.cos(a) * rad, my + math.sin(a) * rad
+                if math.hypot(px - cx, py - cy) > cr - 14.0:
+                    continue
+                gz = self.world.terrain_z(px, py)
+                blk, _ = self.world.is_blocked_point(px, py, gz, 2.8, 9.0)
+                if blk:
+                    continue
+                ok = True
+                for t in threats[:2]:
+                    tp = t["pos"]
+                    eye = [tp[0], tp[1], tp[2] + 8.0]
+                    if self.world.has_los(eye, [px, py, gz + 4.5], 6.0) or self.world.has_los(eye, [px, py, gz + 8.0], 6.0):
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                score = rad + 0.4 * max(0.0, d_me_t - math.hypot(px - tcx, py - tcy))
+                if score < best_s:
+                    best, best_s = (px, py), score
+        self.cover = best
+        self.cover_tick = tick
+        return best
+
     # ------------------------------------------------------------ zone & goals
     def _zone_now(self, obs) -> Tuple[float, float, float]:
         z = obs["zone"]
@@ -517,71 +644,115 @@ class Bot:
         d_cur = dist2d((mx, my), (cx, cy))
         d_next = dist2d((mx, my), (nx, ny))
         tick = int(obs["tick"])
+        self.holding = False
+        self.scan_base = math.atan2(ny - my, nx - mx)
 
         if not me["in_zone"] or d_cur > max(8.0, cr - 18.0):
             return nx, ny, "zone-urgent", energy > 20.0
-        if float(zone["shrink_start"]) - float(obs["t"]) < 12.0 and d_next > max(12.0, nr * 0.82):
+        if float(zone["shrink_start"]) - float(obs["t"]) < 12.0 and d_next > max(12.0, nr * 0.80):
             return nx, ny, "zone-rotate", energy > 45.0
 
         enemies = [m for m in (obs.get("mechs") or []) if m.get("kind") == "mech"]
-        threatened = bool(enemies)
-
-        if not threatened or hp_frac > 0.6:
-            for d in obs.get("drops") or []:
-                dx, dy, _ = d["pos"]
-                if dist2d((dx, dy), (nx, ny)) > nr * 0.95:
-                    continue
-                dd = dist2d((mx, my), (dx, dy))
-                li = float(d.get("lands_in", 0.0))
-                holder = d.get("holder")
-                if dd - li * 11.5 < 95.0 and (holder is None or holder == me["id"] or hp_frac > 0.55):
-                    return dx, dy, f"drop({li:.0f}s)", (li <= 2.0 and dd > 15.0 and energy > 35.0)
-
-        if not threatened:
-            cubes = [c for c in (obs.get("cubes") or [])
-                     if dist2d(c["pos"], (cx, cy)) < cr - 10.0 and abs(c["pos"][2] - mz) < 6.0]
-            if cubes:
-                c = min(cubes, key=lambda q: dist2d(q["pos"], (mx, my)))
-                if dist2d(c["pos"], (mx, my)) < 45.0:
-                    return c["pos"][0], c["pos"][1], "cube", False
-
+        enemies.sort(key=lambda m: dist2d(m["pos"], (mx, my)))
+        close = [e for e in enemies if dist2d(e["pos"], (mx, my)) < 130.0]
         weapons = me.get("weapons") or [None, None]
-        if weapons[1] is None and not threatened:
-            gp = [p for p in (obs.get("pickups") or [])
-                  if p["kind"] != "gun" and dist2d(p["pos"], (cx, cy)) < cr - 10.0
-                  and abs(p["pos"][2] - mz) < 6.0 and tick - self.failed_pickups.get(int(p["id"]), -999) > 25]
-            if gp:
-                p = min(gp, key=lambda q: dist2d(q["pos"], (mx, my)))
-                if dist2d(p["pos"], (mx, my)) < 55.0:
-                    return p["pos"][0], p["pos"][1], f"loot-{p['kind']}", False
+        held = {w["kind"] for w in weapons if w}
+
+        if hp_frac < 0.45 or len(close) >= 2:
+            self.retreat = True
+        elif hp_frac > 0.8 and len(close) <= 1:
+            self.retreat = False
+
+        # a lone enemy that is already on top of us is fought, not fled from, unless we are nearly dead
+        lone_on_us = (len(close) == 1 and dist2d(close[0]["pos"], (mx, my)) < 55.0 and hp_frac >= 0.3)
+
+        if enemies and self.retreat and not lone_on_us:
+            threats = close if close else enemies[:2]
+            cov = self._cover_point(obs, threats)
+            if cov is not None:
+                if dist2d(cov, (mx, my)) < 2.5:
+                    self.holding = True
+                    return mx, my, "cover-hold", False
+                return cov[0], cov[1], "cover", energy > 40.0 and dist2d(cov, (mx, my)) > 10.0
+            tcx = sum(t["pos"][0] for t in threats) / len(threats)
+            tcy = sum(t["pos"][1] for t in threats) / len(threats)
+            d = max(1.0, math.hypot(tcx - mx, tcy - my))
+            gx, gy = mx - (tcx - mx) / d * 35.0, my - (tcy - my) / d * 35.0
+            gd = dist2d((gx, gy), (cx, cy))
+            if gd > cr - 14.0:
+                k = max(0.0, cr - 14.0) / max(1.0, gd)
+                gx, gy = cx + (gx - cx) * k, cy + (gy - cy) * k
+            return gx, gy, "kite", energy > 40.0
+
+        if not enemies:
+            # drops: 3 cubes, full HP and energy. Only if nobody is near it.
+            if hp_frac > 0.5 or not self.retreat:
+                for d in obs.get("drops") or []:
+                    dx, dy, _ = d["pos"]
+                    if dist2d((dx, dy), (nx, ny)) > nr * 0.95:
+                        continue
+                    dd = dist2d((mx, my), (dx, dy))
+                    li = float(d.get("lands_in", 0.0))
+                    holder = d.get("holder")
+                    if dd - li * 11.5 < 95.0 and (holder is None or holder == me["id"]):
+                        return dx, dy, f"drop({li:.0f}s)", (li <= 2.0 and dd > 15.0 and energy > 35.0)
+
+            if not self.retreat:
+                cubes = [c for c in (obs.get("cubes") or [])
+                         if dist2d(c["pos"], (cx, cy)) < cr - 10.0 and abs(c["pos"][2] - mz) < 6.0]
+                if cubes:
+                    c = min(cubes, key=lambda q: dist2d(q["pos"], (mx, my)))
+                    if dist2d(c["pos"], (mx, my)) < 50.0:
+                        return c["pos"][0], c["pos"][1], "cube", False
+
+                # weapons: first a second weapon; later an upgrade over a mortar
+                prio = {"lightning": 5, "laser": 4, "mortar": 2, "gun": 0}
+                have = prio.get(weapons[1]["kind"], 0) if weapons[1] else -9
+                reach = 110.0 if weapons[1] is None else 60.0
+                gp = [p for p in (obs.get("pickups") or [])
+                      if p["kind"] not in held and prio.get(p["kind"], 0) > have + (0 if weapons[1] is None else 1)
+                      and dist2d(p["pos"], (cx, cy)) < cr - 10.0 and abs(p["pos"][2] - mz) < 6.0
+                      and tick - self.failed_pickups.get(int(p["id"]), -999) > 25]
+                if gp:
+                    p = min(gp, key=lambda q: dist2d(q["pos"], (mx, my)) - 12.0 * prio.get(q["kind"], 0))
+                    if dist2d(p["pos"], (mx, my)) < reach:
+                        return p["pos"][0], p["pos"][1], f"loot-{p['kind']}", False
+
+            # recovering and nobody around: stay put and let the 45 HP/s regen run
+            if self.retreat:
+                self.holding = True
+                return mx, my, "regen", False
 
         if target is not None and kind == "mech":
             tx, ty, _ = target["pos"]
             d = max(1.0, dist2d((mx, my), (tx, ty)))
-            held = {w["kind"] for w in weapons if w}
-            close = [e for e in enemies if dist2d(e["pos"], (mx, my)) < 120.0]
-            pref = 32.0 if "lightning" in held else (65.0 if "laser" in held else 50.0)
-            if hp_frac < 0.38 or len(close) >= 3:
-                pref = 100.0
+            ew = target.get("weapons") or []
+            if "lightning" in ew and "lightning" not in held:
+                pref = 66.0
+            elif "lightning" in held:
+                pref = 28.0
+            elif "laser" in held:
+                pref = 70.0
+            else:
+                pref = 52.0
             sign = 1.0 if ((tick // 18 + self.slot) % 2 == 0) else -1.0
             rx, ry = (tx - mx) / d, (ty - my) / d
             sx, sy = -ry * sign, rx * sign
             radial = clamp((d - pref) / 25.0, -0.9, 0.85)
             gx = mx + (rx * radial + sx * 0.85) * 20.0
             gy = my + (ry * radial + sy * 0.85) * 20.0
-            # never kite out of the zone
             gd = dist2d((gx, gy), (cx, cy))
             if gd > cr - 14.0:
-                k = max(0.0, (cr - 14.0)) / max(1.0, gd)
+                k = max(0.0, cr - 14.0) / max(1.0, gd)
                 gx, gy = cx + (gx - cx) * k, cy + (gy - cy) * k
             return gx, gy, "combat", bool(target.get("charging")) and energy > 30.0
 
-        if d_next > max(18.0, nr * 0.55):
-            return nx, ny, "patrol-zone", False
-        if tick % 60 == 0:
-            self.roam_angle = wrap_angle(self.roam_angle + self.rng.uniform(-1.2, 1.2))
-        pr = min(45.0, nr * 0.4)
-        return nx + math.cos(self.roam_angle) * pr, ny + math.sin(self.roam_angle) * pr, "roam", False
+        # nothing going on: sit in a quiet, covered spot on our side of the next zone
+        hx, hy = self._hide_spot(obs)
+        if dist2d((hx, hy), (mx, my)) < 2.5:
+            self.holding = True
+            return mx, my, "hide", False
+        return hx, hy, "to-hide", energy > 70.0 and dist2d((hx, hy), (mx, my)) > 60.0
 
     def _steer(self, obs, gx, gy) -> Tuple[List[float], bool, bool]:
         me = obs["self"]
@@ -608,6 +779,19 @@ class Bot:
                 ddx += nxp * side * 1.5
                 ddy += nyp * side * 1.5
 
+        self._dodge_boost = False
+        for m in obs.get("mechs") or []:
+            if m.get("kind") != "mech" or not m.get("charging"):
+                continue
+            ex, ey = m["pos"][0], m["pos"][1]
+            dd = math.hypot(mx - ex, my - ey)
+            if dd < 250.0 and angle_diff(float(m["aim"][0]), math.atan2(my - ey, mx - ex)) < 0.4:
+                ang = float(m["aim"][0])
+                px_, py_ = -math.sin(ang), math.cos(ang)
+                side = 1.0 if ((mx - ex) * px_ + (my - ey) * py_) >= 0.0 else -1.0
+                ddx += px_ * side * 2.0
+                ddy += py_ * side * 2.0
+                self._dodge_boost = energy > 30.0
         dx = gx - mx + ddx * 12.0
         dy = gy - my + ddy * 12.0
         dg = math.hypot(dx, dy)
@@ -690,7 +874,7 @@ class Bot:
             "move": [round(move_dir[0], 4), round(move_dir[1], 4)],
             "aim": [round(aim[0], 4), round(aim[1], 4)],
             "fire": [bool(fire[0]), bool(fire[1])],
-            "boost": bool((boost_goal and grounded) or (jet_nav and not grounded)),
+            "boost": bool(((boost_goal or self._dodge_boost) and grounded) or (jet_nav and not grounded)),
             "jump": bool(jump_nav),
             "reload": bool(reload_cmd),
         }
