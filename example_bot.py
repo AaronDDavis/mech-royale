@@ -28,11 +28,11 @@ def angle_diff(a: float, b: float) -> float:
 
 
 def dist2d(a, b) -> float:
-    return math.hypot(a[0] - b[0], a - b)
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
 def dist3d(a, b) -> float:
-    return math.sqrt((a[0] - b[0]) ** 2 + (a - b) ** 2 + (a[2] - b[2]) ** 2)
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
 
 
 def point_in_ring(x: float, y: float, ring: List[float]) -> bool:
@@ -100,10 +100,10 @@ class WorldMap:
                         "ring": ring,
                         "holes": p.get("holes") or [],
                         "bbox": bb,
-                        "center": (0.5 * (bb[0] + bb[2]), 0.5 * (bb + bb[3])),
+                        "center": (0.5 * (bb[0] + bb[2]), 0.5 * (bb[1] + bb[3])),
                     })
                     for gx in range(int(bb[0] // self.cs), int(bb[2] // self.cs) + 1):
-                        for gy in range(int(bb // self.cs), int(bb[3] // self.cs) + 1):
+                        for gy in range(int(bb[1] // self.cs), int(bb[3] // self.cs) + 1):
                             self.grid.setdefault((gx, gy), []).append(idx)
                 del w
                 self._precompute_cover_posts()
@@ -136,7 +136,11 @@ class WorldMap:
         return False
 
     def _precompute_cover_posts(self) -> None:
+        t_end = time.perf_counter() + 5.0  # never risk the 20 s ready budget
         for p in self.prisms:
+            if time.perf_counter() > t_end:
+                mf.log("[map] cover post precompute cut at 5 s")
+                break
             if p["kind"] == "bridge" or (p["top"] - p["base"]) < 5.5:
                 continue
             ring = p["ring"]
@@ -216,11 +220,11 @@ class WorldMap:
         return False
 
     def has_los(self, a, b, spacing: float = 4.5) -> bool:
-        dx, dy, dz = b[0] - a[0], b - a, b[2] - a[2]
+        dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
         n = max(3, min(36, int(math.hypot(dx, dy) / spacing)))
         for s in range(1, n):
             t = s / n
-            if self._solid_at(a[0] + dx * t, a + dy * t, a[2] + dz * t):
+            if self._solid_at(a[0] + dx * t, a[1] + dy * t, a[2] + dz * t):
                 return False
         return True
 
@@ -302,8 +306,8 @@ class Bot:
         if r is None:
             p = m["pos"]
             r = self.world.has_los(
-                [me_pos[0], me_pos, me_pos[2] + self._muzzle],
-                [p[0], p, p[2] + h],
+                [me_pos[0], me_pos[1], me_pos[2] + self._muzzle],
+                [p[0], p[1], p[2] + h],
                 8.5 if self.slow else 4.5,
             )
             self._los_cache[key] = r
@@ -377,13 +381,13 @@ class Bot:
         near.sort(key=lambda p: (-rank.get(p["kind"], 0), dist2d(p["pos"], (x, y))))
         best = near[0]
         pid = int(best["id"])
-        if weapons is None:
+        if weapons[1] is None:
             if best["kind"] != "gun":
                 return pid, None
         elif weapons[0] is None:
             return pid, None
         else:
-            w1 = weapons
+            w1 = weapons[1]
             if rank.get(best["kind"], 0) > rank.get(w1["kind"], 0) + 1 and float(w1.get("cooldown", 0.0)) <= 0.2:
                 return pid, 1
         return None, None
@@ -459,8 +463,8 @@ class Bot:
                 yaw = self.last_attacker_bearing
             elif self.last_sound_bearing is not None and tick - self.last_sound_tick < 30:
                 yaw = self.last_sound_bearing
-            elif math.hypot(move_dir[0], move_dir) > 0.1:
-                yaw = math.atan2(move_dir, move_dir[0])
+            elif math.hypot(move_dir[0], move_dir[1]) > 0.1:
+                yaw = math.atan2(move_dir[1], move_dir[0])
             else:
                 yaw = wrap_angle(ayaw + 0.28)
             return [yaw, 0.0], fire, reload_cmd
@@ -591,11 +595,11 @@ class Bot:
         c0, c1 = z["center"], z["next_center"]
         r0, r1 = float(z["radius"]), float(z["next_radius"])
         if t <= s0 or s1 <= s0:
-            return float(c0[0]), float(c0), r0
+            return float(c0[0]), float(c0[1]), r0
         if t >= s1:
-            return float(c1[0]), float(c1), r1
+            return float(c1[0]), float(c1[1]), r1
         a = clamp((t - s0) / (s1 - s0), 0.0, 1.0)
-        return c0[0] + (c1[0] - c0[0]) * a, c0 + (c1 - c0) * a, r0 + (r1 - r0) * a
+        return c0[0] + (c1[0] - c0[0]) * a, c0[1] + (c1[1] - c0[1]) * a, r0 + (r1 - r0) * a
 
     def _choose_stakeout_post(self, obs, nx: float, ny: float, nr: float) -> Tuple[float, float]:
         me = obs["self"]
@@ -643,7 +647,7 @@ class Bot:
         hp_frac = me["hp"] / max(1.0, me["max_hp"])
         energy = float(me["energy"])
         zone = obs["zone"]
-        nx, ny = float(zone["next_center"][0]), float(zone["next_center"])
+        nx, ny = float(zone["next_center"][0]), float(zone["next_center"][1])
         nr = float(zone["next_radius"])
         cx, cy, cr = self._zone_now(obs)
         d_cur = dist2d((mx, my), (cx, cy))
@@ -680,9 +684,9 @@ class Bot:
             c = min(cubes, key=lambda q: dist2d(q["pos"], (mx, my)))
             cdist = dist2d(c["pos"], (mx, my))
             if cdist < (18.0 if close_enemies else 52.0):
-                return c["pos"][0], c["pos"], "cube", False
+                return c["pos"][0], c["pos"][1], "cube", False
 
-        if weapons is None:
+        if weapons[1] is None:
             gp = [
                 p for p in (obs.get("pickups") or [])
                 if p["kind"] != "gun"
@@ -693,7 +697,7 @@ class Bot:
             if gp:
                 gp.sort(key=lambda p: (0 if p["kind"] in ("lightning", "laser") else 1, dist2d(p["pos"], (mx, my))))
                 if dist2d(gp[0]["pos"], (mx, my)) < (25.0 if close_enemies else 65.0):
-                    return gp[0]["pos"][0], gp[0]["pos"], f"loot-{gp[0]['kind']}", False
+                    return gp[0]["pos"][0], gp[0]["pos"][1], f"loot-{gp[0]['kind']}", False
 
         if target is not None and kind == "mech":
             tx, ty, tz = target["pos"]
@@ -702,15 +706,15 @@ class Bot:
             ew = target.get("weapons") or []
 
             gun_reloading = any(w and w["kind"] == "gun" and float(w.get("reload", 0.0)) > 0.35 for w in weapons)
-            sec_ready = weapons is not None and float(weapons.get("cooldown", 0.0)) <= 0.15 and (
-                weapons["kind"] != "lightning" or d <= 44.0
+            sec_ready = weapons[1] is not None and float(weapons[1].get("cooldown", 0.0)) <= 0.15 and (
+                weapons[1]["kind"] != "lightning" or d <= 44.0
             )
 
             need_cover = (hp_frac < 0.44) or (len(close_enemies) >= 2) or (gun_reloading and not sec_ready)
             if need_cover:
                 cov = self.world.find_combat_cover(mx, my, mz, tx, ty, tz, cx, cy, cr, want_los=False)
                 if cov is not None:
-                    return cov[0], cov, "cover-hide", (hp_frac < 0.38 and energy > 30.0)
+                    return cov[0], cov[1], "cover-hide", (hp_frac < 0.38 and energy > 30.0)
 
             peek = self.world.find_combat_cover(mx, my, mz, tx, ty, tz, cx, cy, cr, want_los=True)
             if peek is not None and not ("lightning" in held and d < 38.0):
@@ -718,7 +722,7 @@ class Bot:
                 rx, ry = (tx - mx) / d, (ty - my) / d
                 sx, sy = -ry * jiggle, rx * jiggle
                 gx = peek[0] + sx * 4.5
-                gy = peek + sy * 4.5
+                gy = peek[1] + sy * 4.5
                 return gx, gy, "stakeout-peek", bool(target.get("charging")) and energy > 30.0
 
             if "lightning" in ew and "lightning" not in held:
@@ -867,9 +871,9 @@ class Bot:
         grounded = bool(me.get("grounded", True))
         act: Dict[str, Any] = {
             "tick": obs["tick"],
-            "move": [round(move_dir[0], 4), round(move_dir, 4)],
-            "aim": [round(aim[0], 4), round(aim, 4)],
-            "fire": [bool(fire[0]), bool(fire)],
+            "move": [round(move_dir[0], 4), round(move_dir[1], 4)],
+            "aim": [round(aim[0], 4), round(aim[1], 4)],
+            "fire": [bool(fire[0]), bool(fire[1])],
             "boost": bool((boost_goal and grounded) or (jet_nav and not grounded)),
             "jump": bool(jump_nav),
             "reload": bool(reload_cmd),
@@ -888,7 +892,7 @@ class Bot:
     def _fallback(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         z = obs["zone"]
-        dx, dy = z["next_center"][0] - me["pos"][0], z["next_center"] - me["pos"]
+        dx, dy = z["next_center"][0] - me["pos"][0], z["next_center"][1] - me["pos"][1]
         d = max(1.0, math.hypot(dx, dy))
         return {"tick": obs["tick"], "move": [dx / d, dy / d], "fire": [False, False]}
 
